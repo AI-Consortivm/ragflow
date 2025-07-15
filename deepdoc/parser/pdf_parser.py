@@ -1240,29 +1240,344 @@ class PlainParser:
     def __call__(self, filename, from_page=0, to_page=100000, **kwargs):
         self.outlines = []
         lines = []
+        
+        # Try pymupdf first if available (best quality)
         try:
-            self.pdf = pdf2_read(
-                filename if isinstance(
-                    filename, str) else BytesIO(filename))
-            for page in self.pdf.pages[from_page:to_page]:
-                lines.extend([t for t in page.extract_text().split("\n")])
+            logging.info("PlainParser: Attempting pymupdf extraction (primary method)")
+            lines = self._extract_with_pymupdf(filename, from_page, to_page)
+            total_text = "".join(lines).strip()
+            
+            if len(total_text) < 50:
+                logging.warning(f"PlainParser: pymupdf yielded minimal text ({len(total_text)} chars), trying fallback")
+                raise Exception("Minimal text, try next method")
+            else:
+                logging.info(f"PlainParser: pymupdf extraction successful - {len(lines)} text blocks, {len(total_text)} total chars")
+                final_result = [(line, "") for line in lines]
+                return final_result, []
+                
+        except Exception as e:
+            logging.info(f"PlainParser: pymupdf extraction failed: {e}")
+        
+        # Try pypdf as fallback
+        try:
+            logging.info("PlainParser: Attempting pypdf extraction (fallback method)")
+            lines = self._extract_with_pypdf(filename, from_page, to_page)
+            total_text = "".join(lines).strip()
+            
+            if len(total_text) < 50:  # Too little text, likely scanned PDF
+                logging.warning(f"PlainParser: pypdf yielded minimal text ({len(total_text)} chars), falling back to OCR")
+                return self._fallback_to_ocr(filename, from_page, to_page, **kwargs)
+            else:
+                logging.info(f"PlainParser: pypdf extraction successful - {len(lines)} text blocks, {len(total_text)} total chars")
+                
+        except Exception as e:
+            logging.warning(f"PlainParser: pypdf extraction failed: {e}, falling back to OCR")
+            return self._fallback_to_ocr(filename, from_page, to_page, **kwargs)
 
+        final_result = [(line, "") for line in lines]
+        
+        # Final quality assessment
+        if final_result:
+            avg_line_length = sum(len(line) for line, _ in final_result) / len(final_result)
+            logging.info(f"PlainParser: Final result - {len(final_result)} lines, avg {avg_line_length:.1f} chars/line")
+        else:
+            logging.warning("PlainParser: No text extracted from document")
+            
+        return final_result, []
+
+    def _extract_with_pymupdf(self, filename, from_page, to_page):
+        """
+        Extract text using pymupdf (fitz) - often superior to pdfplumber
+        """
+        try:
+            import fitz  # pymupdf
+        except ImportError:
+            logging.info("pymupdf not installed, install with: pip install pymupdf")
+            raise ImportError("pymupdf not available")
+            
+        lines = []
+        logging.info(f"Starting pymupdf extraction for pages {from_page}-{to_page}")
+        
+        # Open PDF
+        if isinstance(filename, str):
+            doc = fitz.open(filename)
+        else:
+            doc = fitz.open(stream=filename, filetype="pdf")
+        
+        try:
+            # Extract outlines
+            self._extract_outlines_pymupdf(doc)
+            
+            # Extract text from pages
+            total_pages = min(doc.page_count, to_page)
+            logging.info(f"Processing {total_pages - from_page} pages with pymupdf")
+            
+            for page_num in range(from_page, total_pages):
+                page = doc[page_num]
+                
+                # Try multiple extraction strategies for better quality
+                text = self._extract_page_text_pymupdf(page, page_num)
+                
+                if text and len(text.strip()) > 0:
+                    # Clean and filter the text
+                    text = self._clean_extracted_text(text)
+                    if text:  # Only add if text remains after cleaning
+                        lines.append(text)
+                        logging.debug(f"Page {page_num}: extracted {len(text)} chars")
+                else:
+                    logging.warning(f"Page {page_num}: no text extracted")
+            
+            doc.close()
+            
+        except Exception as e:
+            doc.close()
+            raise e
+            
+        total_text = "".join(lines)
+        logging.info(f"pymupdf total extraction: {len(total_text)} characters, {len(lines)} lines")
+        if total_text:
+            logging.info(f"Sample extracted text: {total_text[:200]}...")
+        return lines
+
+    def _extract_page_text_pymupdf(self, page, page_num):
+        """
+        Extract text from a single page using simple, reliable pymupdf strategies
+        Focus on speed and reliability over complexity
+        """
+        # Strategy 1: Layout-preserved extraction with enhanced flags for better word spacing
+        # TEXT_INHIBIT_SPACES prevents automatic space insertion where gaps exist
+        # TEXT_DEHYPHENATE joins hyphenated words across lines  
+        # TEXT_PRESERVE_WHITESPACE maintains original layout spacing
+        try:
+            flags = (fitz.TEXT_PRESERVE_WHITESPACE | 
+                    fitz.TEXT_INHIBIT_SPACES | 
+                    fitz.TEXT_DEHYPHENATE)
+            text = page.get_text("text", flags=flags, sort=True)
+            if text and len(text.strip()) > 10:
+                logging.debug(f"Page {page_num}: pymupdf enhanced extraction succeeded ({len(text)} chars)")
+                return text
+        except Exception as e:
+            logging.debug(f"Page {page_num}: pymupdf enhanced extraction failed: {e}")
+
+        # Strategy 2: Fallback with just space inhibition (if dehyphenation causes issues)
+        try:
+            flags = (fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_INHIBIT_SPACES)
+            text = page.get_text("text", flags=flags, sort=True)
+            if text and len(text.strip()) > 10:
+                logging.debug(f"Page {page_num}: pymupdf space-inhibited extraction succeeded ({len(text)} chars)")
+                return text
+        except Exception as e:
+            logging.debug(f"Page {page_num}: pymupdf space-inhibited extraction failed: {e}")
+
+        # Strategy 3: Original layout-preserved as fallback
+        try:
+            text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE, sort=True)
+            if text and len(text.strip()) > 10:
+                logging.debug(f"Page {page_num}: pymupdf layout-preserved extraction succeeded ({len(text)} chars)")
+                return text
+        except Exception as e:
+            logging.debug(f"Page {page_num}: pymupdf layout-preserved extraction failed: {e}")
+
+        # Strategy 4: Default text extraction with sorting as final fallback
+        try:
+            text = page.get_text(sort=True)
+            if text and len(text.strip()) > 10:
+                logging.debug(f"Page {page_num}: pymupdf default sorted extraction succeeded ({len(text)} chars)")
+                return text
+        except Exception as e:
+            logging.debug(f"Page {page_num}: pymupdf default sorted failed: {e}")
+
+        logging.warning(f"Page {page_num}: all pymupdf extraction strategies failed")
+        return ""
+
+    def _clean_extracted_text(self, text):
+        """
+        Simple text cleanup - let PyMuPDF handle the structure
+        """
+        if not text:
+            return ""
+        
+        # Basic cleanup only - no content filtering
+        text = re.sub(r'\r\n', '\n', text)  # Normalize line endings
+        text = re.sub(r'\r', '\n', text)    # Convert remaining \r to \n
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Reduce excessive line breaks
+        text = re.sub(r'[ \t]{2,}', ' ', text)   # Reduce excessive spaces/tabs
+        
+        # Remove control characters only
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        
+        # Clean up hyphenation across lines
+        text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
+        
+        # Final cleanup
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        text = text.strip()
+        
+        if len(text) < 3:
+            return ""
+        
+        return text
+
+    def _extract_outlines_pymupdf(self, doc):
+        """Extract outlines/bookmarks from pymupdf document"""
+        try:
+            toc = doc.get_toc()
+            for level, title, page_num in toc:
+                self.outlines.append((title, level - 1))  # Adjust level to 0-based
+            logging.debug(f"Extracted {len(self.outlines)} outline items")
+        except Exception as e:
+            logging.debug(f"Failed to extract outlines with pymupdf: {e}")
+        
+        if not self.outlines:
+            logging.warning("No outlines found")
+
+    def _extract_with_pypdf(self, filename, from_page, to_page):
+        lines = []
+        logging.info(f"Starting pypdf extraction for pages {from_page}-{to_page}")
+        
+        # Open PDF with better error handling
+        try:
+            if isinstance(filename, str):
+                with open(filename, 'rb') as file:
+                    self.pdf = pdf2_read(file)
+            else:
+                self.pdf = pdf2_read(BytesIO(filename))
+        except Exception as e:
+            logging.error(f"Failed to open PDF with pypdf: {e}")
+            raise e
+        
+        total_pages = min(len(self.pdf.pages), to_page)
+        logging.info(f"Processing {total_pages - from_page} pages with pypdf")
+        
+        for page_num in range(from_page, total_pages):
+            try:
+                page = self.pdf.pages[page_num]
+                
+                # Extract text with multiple strategies
+                text = ""
+                
+                # Strategy 1: Standard extraction
+                try:
+                    text = page.extract_text()
+                except Exception as e:
+                    logging.debug(f"Page {page_num}: pypdf standard extraction failed: {e}")
+                
+                # Strategy 2: Enhanced extraction (if available)
+                if not text or len(text.strip()) < 10:
+                    try:
+                        # Try extraction with space width parameter for better word separation
+                        text = page.extract_text(space_width=200)
+                    except Exception as e:
+                        logging.debug(f"Page {page_num}: pypdf enhanced extraction failed: {e}")
+                
+                # Clean and validate the text
+                if text:
+                    text = self._clean_extracted_text(text)
+                    if text:
+                        lines.append(text)
+                        logging.debug(f"Page {page_num}: pypdf extracted {len(text)} chars")
+                    else:
+                        logging.debug(f"Page {page_num}: text discarded after cleaning")
+                else:
+                    logging.warning(f"Page {page_num}: pypdf extraction yielded no text")
+                    
+            except Exception as e:
+                logging.warning(f"Page {page_num}: pypdf extraction failed: {e}")
+                continue
+
+        # Extract outlines/bookmarks if available
+        try:
+            self._extract_outlines_pypdf()
+        except Exception as e:
+            logging.debug(f"pypdf outline extraction failed: {e}")
+
+        total_text = "".join(lines)
+        logging.info(f"pypdf total extraction: {len(total_text)} characters, {len(lines)} lines")
+        if total_text:
+            logging.info(f"Sample extracted text: {total_text[:200]}...")
+        return lines
+
+    def _extract_outlines_pypdf(self):
+        """Extract outlines/bookmarks from pypdf document"""
+        try:
             outlines = self.pdf.outline
 
             def dfs(arr, depth):
                 for a in arr:
                     if isinstance(a, dict):
-                        self.outlines.append((a["/Title"], depth))
+                        title = a.get("/Title", "")
+                        if title:
+                            self.outlines.append((title, depth))
                         continue
                     dfs(a, depth + 1)
 
             dfs(outlines, 0)
-        except Exception:
-            logging.exception("Outlines exception")
-        if not self.outlines:
-            logging.warning("Miss outlines")
+            
+            if self.outlines:
+                logging.debug(f"Extracted {len(self.outlines)} outline entries")
+            else:
+                logging.debug("No outlines found in document")
+                
+        except Exception as e:
+            logging.debug(f"pypdf outline extraction failed: {e}")
+            self.outlines = []
 
-        return [(line, "") for line in lines], []
+    def _fallback_to_ocr(self, filename, from_page, to_page, **kwargs):
+        # Fallback to RAGFlowPdfParser for OCR when no text is found
+        logging.info("PlainParser: Using OCR fallback for text extraction")
+        
+        # Process OCR in chunks of 35 pages to avoid overwhelming the system
+        chunk_size = 35
+        all_lines = []
+        all_tables = []
+        
+        # Calculate total pages for chunking
+        current_page = from_page
+        
+        while current_page <= to_page:
+            chunk_end = min(current_page + chunk_size - 1, to_page)
+            logging.info(f"PlainParser: Processing OCR chunk {current_page}-{chunk_end} (chunk size: {chunk_size})")
+            
+            try:
+                ocr_parser = RAGFlowPdfParser()
+                ocr_parser.page_from = current_page
+                
+                input_file = filename
+                boxes, tables = ocr_parser(input_file, **kwargs)
+                
+                # Convert boxes to lines format
+                chunk_lines = []
+                for box in boxes:
+                    if isinstance(box, dict) and 'text' in box:
+                        text_lines = box['text'].split('\n')
+                        chunk_lines.extend(text_lines)
+                    elif isinstance(box, (tuple, list)) and len(box) >= 2:
+                        # Handle (text, metadata) format
+                        text_lines = str(box[0]).split('\n')
+                        chunk_lines.extend(text_lines)
+                    else:
+                        chunk_lines.append(str(box))
+                
+                # Filter empty lines and clean up
+                chunk_lines = [line.strip() for line in chunk_lines if line.strip()]
+                all_lines.extend(chunk_lines)
+                all_tables.extend(tables if tables else [])
+                
+                logging.info(f"PlainParser: OCR chunk {current_page}-{chunk_end} completed - {len(chunk_lines)} lines extracted")
+                
+            except Exception as e:
+                logging.error(f"PlainParser: OCR chunk {current_page}-{chunk_end} failed: {e}")
+                # Continue with next chunk even if this one fails
+                
+            current_page = chunk_end + 1
+        
+        total_text = " ".join(all_lines)
+        logging.info(f"PlainParser: OCR extraction completed - {len(all_lines)} total lines, {len(total_text)} total chars")
+        
+        if len(total_text) < 20:
+            logging.warning("PlainParser: OCR extraction yielded minimal text, document may be image-only or corrupted")
+        
+        return [(line, "") for line in all_lines], all_tables
 
     def crop(self, ck, need_position):
         raise NotImplementedError

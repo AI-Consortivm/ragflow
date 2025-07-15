@@ -207,22 +207,26 @@ def not_bullet(line):
 
 def bullets_category(sections):
     global BULLET_PATTERN
+    
+    # Simple pattern matching - find the best bullet pattern
     hits = [0] * len(BULLET_PATTERN)
-    for i, pro in enumerate(BULLET_PATTERN):
+    
+    for i, pattern_group in enumerate(BULLET_PATTERN):
         for sec in sections:
-            for p in pro:
+            for p in pattern_group:
                 if re.match(p, sec) and not not_bullet(sec):
                     hits[i] += 1
                     break
-    maxium = 0
-    res = -1
-    for i, h in enumerate(hits):
-        if h <= maxium:
-            continue
-        res = i
-        maxium = h
+    
+    # Find pattern with most hits
+    max_hits = max(hits) if hits else 0
+    res = hits.index(max_hits) if max_hits > 0 else -1
+    
+    # Only use pattern if it has reasonable coverage
+    if res >= 0 and hits[res] < len(sections) * 0.1:
+        res = -1
+    
     return res
-
 
 def is_english(texts):
     eng = 0
@@ -517,69 +521,134 @@ def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
     tk_nums = [0]
 
     def add_chunk(t, pos):
-        nonlocal cks, tk_nums, delimiter
+        nonlocal cks, tk_nums
         tnum = num_tokens_from_string(t)
         if not pos:
             pos = ""
         if tnum < 8:
             pos = ""
-        # Ensure that the length of the merged chunk does not exceed chunk_token_num  
-        if tk_nums[-1] > chunk_token_num:
-
+        
+        # Start new chunk if current is empty or would exceed limit
+        if cks[-1] == "" or tk_nums[-1] + tnum > chunk_token_num:
             if t.find(pos) < 0:
                 t += pos
             cks.append(t)
             tk_nums.append(tnum)
         else:
+            # Add to current chunk with proper spacing
             if cks[-1].find(pos) < 0:
                 t += pos
+            
+            # SIMPLE FIX: Add space when concatenating unless already has spacing or punctuation
+            current_chunk = cks[-1]
+            if (current_chunk and t and 
+                not current_chunk.endswith((' ', '\n', '\t')) and 
+                not t.startswith((' ', '\n', '\t')) and
+                not current_chunk.endswith(('.', '!', '?', '。', '！', '？', '；', ';'))):
+                cks[-1] += " "
+            
             cks[-1] += t
             tk_nums[-1] += tnum
 
-    for sec, pos in sections:
-        add_chunk(sec, pos)
-
-    return cks
+    # Convert escape sequences in delimiter (critical fix for 'n' deletion bug)
+    # Use our fixed get_delimiters function instead of direct encoding
+    processed_delimiter = get_delimiters(delimiter)
     
+    # Simple processing - just split and merge
+    for section_txt, pos in sections:
+        if not section_txt:
+            continue
+            
+        # Use the properly processed delimiter pattern directly
+        parts = re.split(f'({processed_delimiter})', section_txt.strip())
+        result_parts = []
+        
+        for part in parts:
+            # Skip delimiter matches and empty parts
+            if part and not re.match(f'^({processed_delimiter})$', part):
+                result_parts.append(part.strip())
+        
+        for part in result_parts:
+            if part:
+                add_chunk(part, pos)
+
+    return [ck for ck in cks if ck]
+
 
 def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。；！？"):
-    if not texts or len(texts) != len(images):
+    if not texts:
         return [], []
-    # Enuser texts is str not tuple, if it is tuple, convert to str (get the first item)
-    if isinstance(texts[0], tuple):
-        texts = [t[0] for t in texts]
+    if isinstance(texts[0], type("")):
+        texts = [(s, "") for s in texts]
+    
+    assert len(texts) == len(images), "texts and images must have same length"
+    
     cks = [""]
-    result_images = [None]
+    images_result = [None]
     tk_nums = [0]
-
+    
     def add_chunk(t, image, pos=""):
-        nonlocal cks, result_images, tk_nums, delimiter
+        nonlocal cks, images_result, tk_nums
         tnum = num_tokens_from_string(t)
         if not pos:
             pos = ""
         if tnum < 8:
             pos = ""
-        # Ensure that the length of the merged chunk does not exceed chunk_token_num
-        if tk_nums[-1] > chunk_token_num:
+        
+        # Start new chunk if current is empty or would exceed limit
+        if cks[-1] == "" or tk_nums[-1] + tnum > chunk_token_num:
             if t.find(pos) < 0:
                 t += pos
             cks.append(t)
-            result_images.append(image)
+            images_result.append(image)
             tk_nums.append(tnum)
         else:
+            # Add to current chunk with proper spacing
             if cks[-1].find(pos) < 0:
                 t += pos
+            
+            # Simple spacing fix - same as naive_merge
+            current_chunk = cks[-1]
+            if (current_chunk and t and 
+                not current_chunk.endswith((' ', '\n', '\t')) and 
+                not t.startswith((' ', '\n', '\t')) and
+                not current_chunk.endswith(('.', '!', '?', '。', '！', '？', '；', ';'))):
+                cks[-1] += " "
+            
             cks[-1] += t
-            if result_images[-1] is None:
-                result_images[-1] = image
-            else:
-                result_images[-1] = concat_img(result_images[-1], image)
             tk_nums[-1] += tnum
+            
+            # Combine images
+            if image and images_result[-1]:
+                images_result[-1] = concat_img(images_result[-1], image)
+            elif image:
+                images_result[-1] = image
 
-    for text, image in zip(texts, images):
-        add_chunk(text, image)
+    # Convert escape sequences in delimiter (critical fix for 'n' deletion bug)
+    # Use our fixed get_delimiters function instead of direct encoding
+    processed_delimiter = get_delimiters(delimiter)
+    
+    # Simple processing - just split and merge
+    for (section_txt, pos), image in zip(texts, images):
+        if not section_txt:
+            continue
+            
+        # Use the properly processed delimiter pattern directly
+        parts = re.split(f'({processed_delimiter})', section_txt.strip())
+        result_parts = []
+        
+        for part in parts:
+            # Skip delimiter matches and empty parts
+            if part and not re.match(f'^({processed_delimiter})$', part):
+                result_parts.append(part.strip())
+        
+        for i, part in enumerate(result_parts):
+            if part:
+                # Only attach image to first part of each section
+                part_image = image if i == 0 else None
+                add_chunk(part, part_image, pos)
 
-    return cks, result_images
+    return [ck for ck in cks if ck], [img for img in images_result if cks[images_result.index(img)]]
 
 def docx_question_level(p, bull=-1):
     txt = re.sub(r"\u3000", " ", p.text).strip()
@@ -617,35 +686,104 @@ def concat_img(img1, img2):
 def naive_merge_docx(sections, chunk_token_num=128, delimiter="\n。；！？"):
     if not sections:
         return [], []
-
+    
     cks = [""]
-    images = [None]
+    images_result = [None]
     tk_nums = [0]
-
+    
     def add_chunk(t, image, pos=""):
-        nonlocal cks, tk_nums, delimiter
+        nonlocal cks, images_result, tk_nums
         tnum = num_tokens_from_string(t)
+        if not pos:
+            pos = ""
         if tnum < 8:
             pos = ""
-        if tk_nums[-1] > chunk_token_num:
+        
+        # Start new chunk if current is empty or would exceed limit
+        if cks[-1] == "" or tk_nums[-1] + tnum > chunk_token_num:
             if t.find(pos) < 0:
                 t += pos
             cks.append(t)
-            images.append(image)
+            images_result.append(image)
             tk_nums.append(tnum)
         else:
+            # Add to current chunk with proper spacing
             if cks[-1].find(pos) < 0:
                 t += pos
+            
+            # Simple spacing fix - same as naive_merge
+            current_chunk = cks[-1]
+            if (current_chunk and t and 
+                not current_chunk.endswith((' ', '\n', '\t')) and 
+                not t.startswith((' ', '\n', '\t')) and
+                not current_chunk.endswith(('.', '!', '?', '。', '！', '？', '；', ';'))):
+                cks[-1] += " "
+            
             cks[-1] += t
-            images[-1] = concat_img(images[-1], image)
             tk_nums[-1] += tnum
+            
+            # Combine images
+            if image and images_result[-1]:
+                images_result[-1] = concat_img(images_result[-1], image)
+            elif image:
+                images_result[-1] = image
 
-    for sec, image in sections:
-        add_chunk(sec, image, '')
+    # Convert escape sequences in delimiter (critical fix for 'n' deletion bug)
+    # Use our fixed get_delimiters function instead of direct encoding
+    processed_delimiter = get_delimiters(delimiter)
+    
+    # Simple processing - just split and merge
+    for section_txt, image in sections:
+        if not section_txt:
+            continue
+            
+        # Use the properly processed delimiter pattern directly
+        parts = re.split(f'({processed_delimiter})', section_txt.strip())
+        result_parts = []
+        
+        for part in parts:
+            # Skip delimiter matches and empty parts
+            if part and not re.match(f'^({processed_delimiter})$', part):
+                result_parts.append(part.strip())
+        
+        for i, part in enumerate(result_parts):
+            if part:
+                # Only attach image to first part of each section
+                part_image = image if i == 0 else None
+                add_chunk(part, part_image)
 
-    return cks, images
+    return [ck for ck in cks if ck], [img for img in images_result if cks[images_result.index(img)]]
 
 
 def extract_between(text: str, start_tag: str, end_tag: str) -> list[str]:
     pattern = re.escape(start_tag) + r"(.*?)" + re.escape(end_tag)
     return re.findall(pattern, text, flags=re.DOTALL)
+
+
+def get_delimiters(delimiters: str):
+    # CRITICAL FIX: Only convert actual escape sequences, don't corrupt Unicode
+    # Replace common escape sequences manually to avoid corrupting Chinese characters
+    delimiters = delimiters.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+    
+    # Escape special regex characters for safe splitting
+    escaped_chars = [re.escape(char) for char in delimiters]
+    return '|'.join(escaped_chars)
+
+def smart_text_split(text, delimiters):
+    """Simple text splitting using the processed delimiters"""
+    if not text or not delimiters:
+        return [text] if text else []
+    
+    # Get the properly processed delimiter pattern
+    delimiter_pattern = get_delimiters(delimiters)
+    
+    # Split and filter out delimiter matches and empty parts
+    parts = re.split(f'({delimiter_pattern})', text)
+    result = []
+    
+    for part in parts:
+        # Skip delimiter matches and empty parts
+        if part and not re.match(f'^({delimiter_pattern})$', part):
+            result.append(part)
+    
+    return result
