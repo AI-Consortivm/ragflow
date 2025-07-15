@@ -1,0 +1,69 @@
+# docker-compose.override.yml
+# Production overrides for RagFlow deployment
+#
+# Usage:
+#   1. Generate .env file from Infisical: infisical export --format=dotenv > .env
+#   2. Start with profile: docker compose --profile elasticsearch up -d
+#
+# This will start: 
+#   - elasticsearch (from profile)
+#   - minio (no profiles = always start)
+#   - mysql and redis are disabled via scale: 0
+
+services:
+  # === DISABLE SERVICES WE'RE REPLACING ===
+  redis:
+    scale: 0  # Using Azure Redis Cache
+
+  # === MODIFY RAGFLOW SERVICE ===
+  ragflow:
+    depends_on:
+      mysql:
+        condition: service_healthy
+        required: true
+    command:
+      - --disable-taskexecutor
+
+  # === BIND MOUNTS FOR DATA PERSISTENCE ===
+  es01:
+    volumes:
+      - /docker-data/elasticsearch:/usr/share/elasticsearch/data
+    restart: unless-stopped
+
+  mysql:
+    volumes:
+      - /docker-data/mysql:/var/lib/mysql
+    restart: unless-stopped
+
+  minio:
+    volumes:
+      - /docker-data/minio:/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+        required: true
+      ragflow:
+        condition: service_started
+    networks:
+      - ragflow
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Mount your Caddyfile
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      # Persist ACME certs and state
+      - /docker-data/caddy_data:/data
+      - /docker-data/caddy_config:/config
+
+# Remove unused volume definitions
+volumes:
+  osdata01: null
+  infinity_data: null
+  redis_data: null

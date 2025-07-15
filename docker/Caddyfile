@@ -1,0 +1,22 @@
+# Global options block (optional)
+{
+	# LetsEncrypt email for urgent notices & rate-limit recovery
+	email andres.martin@aikit.es
+	# Uncomment to use a self-signed internal CA instead
+	# tls internal
+}
+
+# Site block for your DNS name
+aikit-ragflow.germanywestcentral.cloudapp.azure.com {
+	# Forward all incoming requests to the RagFlow container
+	reverse_proxy ragflow:80
+
+	# Enable gzip compression on responses
+	encode gzip
+
+	# (Optional) Customize headers
+	header {
+		# HSTS: tell browsers to always use HTTPS
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+	}
+}
