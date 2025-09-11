@@ -22,6 +22,9 @@ import valkey as redis
 from rag import settings
 from rag.utils import singleton
 from valkey.lock import Lock
+from valkey.retry import Retry
+from valkey.backoff import ExponentialBackoff
+from valkey.exceptions import ConnectionError, TimeoutError, BusyLoadingError
 import trio
 
 class RedisMsg:
@@ -71,36 +74,99 @@ class RedisDB:
 
     def __open__(self):
         try:
-            self.REDIS = redis.StrictRedis(
-                host=self.config["host"].split(":")[0],
-                port=int(self.config.get("host", ":6379").split(":")[1]),
-                db=int(self.config.get("db", 1)),
-                password=self.config.get("password"),
-                decode_responses=True,
-            )
+            # Configure retry with exponential backoff for connection resilience
+            retry_config = Retry(ExponentialBackoff(), 3)
+            retry_on_error_list = [ConnectionError, TimeoutError, BusyLoadingError]
+            
+            # Extract connection parameters with Azure Redis best practices
+            host_parts = self.config["host"].split(":")
+            host = host_parts[0]
+            port = int(host_parts[1]) if len(host_parts) > 1 else int(self.config.get("port", 6379))
+            
+            connection_params = {
+                "host": host,
+                "port": port,
+                "db": int(self.config.get("db", 1)),
+                "password": self.config.get("password"),
+                "decode_responses": True,
+                
+                # SSL/TLS support for Azure Redis
+                "ssl": bool(self.config.get("ssl", False)),
+                "ssl_cert_reqs": None if not self.config.get("ssl", False) else "required",
+                
+                # Connection hardening for Azure Redis
+                "retry": retry_config,
+                "retry_on_error": retry_on_error_list,
+                "retry_on_timeout": True,
+                "health_check_interval": int(self.config.get("health_check_interval", 30)),
+                "socket_timeout": float(self.config.get("socket_timeout", 30)),
+                "socket_connect_timeout": float(self.config.get("socket_connect_timeout", 10)),
+                "socket_keepalive": True
+            }
+            
+            self.REDIS = redis.StrictRedis(**connection_params)
             self.register_scripts()
-        except Exception:
-            logging.warning("Redis can't be connected.")
+            logging.info(f"Redis connected with health check interval: {connection_params['health_check_interval']}s")
+        except Exception as e:
+            logging.warning(f"Redis can't be connected: {e}")
         return self.REDIS
 
     def health(self):
-        self.REDIS.ping()
-        a, b = "xx", "yy"
-        self.REDIS.set(a, b, 3)
+        if not self.REDIS:
+            return False
+        
+        try:
+            self.REDIS.ping()
+            a, b = "xx", "yy"
+            self.REDIS.set(a, b, 3)
 
-        if self.REDIS.get(a) == b:
-            return True
+            if self.REDIS.get(a) == b:
+                return True
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"Redis health check failed with transient error: {e}")
+            return False
+        except Exception as e:
+            logging.warning(f"Redis health check failed with unexpected error: {e}")
+            return False
+        
+        return False
 
     def is_alive(self):
         return self.REDIS is not None
+    
+    def check_connection_health(self):
+        """
+        Check Redis connection health and reconnect if needed.
+        Returns True if connection is healthy, False otherwise.
+        """
+        if not self.REDIS:
+            logging.warning("Redis connection is None, attempting to reconnect")
+            self.__open__()
+            return self.REDIS is not None
+            
+        try:
+            # Use PING to check connection health
+            self.REDIS.ping()
+            return True
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"Redis health check failed with transient error: {e}. Reconnecting.")
+            self.__open__()
+            return self.REDIS is not None
+        except Exception as e:
+            logging.error(f"Redis health check failed with unexpected error: {e}. Reconnecting.")
+            self.__open__()
+            return self.REDIS is not None
 
     def exist(self, k):
         if not self.REDIS:
             return
         try:
             return self.REDIS.exists(k)
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"RedisDB.exist {k} got transient error: {e}. Attempting reconnection.")
+            self.__open__()
         except Exception as e:
-            logging.warning("RedisDB.exist " + str(k) + " got exception: " + str(e))
+            logging.warning(f"RedisDB.exist {k} got unexpected exception: {e}")
             self.__open__()
 
     def get(self, k):
@@ -108,16 +174,22 @@ class RedisDB:
             return
         try:
             return self.REDIS.get(k)
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"RedisDB.get {k} got transient error: {e}. Attempting reconnection.")
+            self.__open__()
         except Exception as e:
-            logging.warning("RedisDB.get " + str(k) + " got exception: " + str(e))
+            logging.warning(f"RedisDB.get {k} got unexpected exception: {e}")
             self.__open__()
 
     def set_obj(self, k, obj, exp=3600):
         try:
             self.REDIS.set(k, json.dumps(obj, ensure_ascii=False), exp)
             return True
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"RedisDB.set_obj {k} got transient error: {e}. Attempting reconnection.")
+            self.__open__()
         except Exception as e:
-            logging.warning("RedisDB.set_obj " + str(k) + " got exception: " + str(e))
+            logging.warning(f"RedisDB.set_obj {k} got unexpected exception: {e}")
             self.__open__()
         return False
 
@@ -125,8 +197,11 @@ class RedisDB:
         try:
             self.REDIS.set(k, v, exp)
             return True
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"RedisDB.set {k} got transient error: {e}. Attempting reconnection.")
+            self.__open__()
         except Exception as e:
-            logging.warning("RedisDB.set " + str(k) + " got exception: " + str(e))
+            logging.warning(f"RedisDB.set {k} got unexpected exception: {e}")
             self.__open__()
         return False
 
@@ -327,8 +402,11 @@ class RedisDB:
         try:
             self.REDIS.delete(key)
             return True
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"RedisDB.delete {key} got transient error: {e}. Attempting reconnection.")
+            self.__open__()
         except Exception as e:
-            logging.warning("RedisDB.delete " + str(key) + " got exception: " + str(e))
+            logging.warning(f"RedisDB.delete {key} got unexpected exception: {e}")
             self.__open__()
         return False
     
@@ -347,8 +425,22 @@ class RedisDistributedLock:
         self.lock = Lock(REDIS_CONN.REDIS, lock_key, timeout=timeout, blocking_timeout=blocking_timeout)
 
     def acquire(self):
-        REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
-        return self.lock.acquire(token=self.lock_value)
+        """
+        Acquire lock with improved error handling for connection issues.
+        """
+        try:
+            REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
+            result = self.lock.acquire(token=self.lock_value)
+            if result:
+                logging.debug(f"Successfully acquired Redis lock: {self.lock_key}")
+            return result
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"Transient Redis error during lock acquire for {self.lock_key}: {e}")
+            # Let the retry mechanism in the client handle this
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error during lock acquire for {self.lock_key}: {e}")
+            raise
 
     async def spin_acquire(self):
         REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
@@ -358,4 +450,24 @@ class RedisDistributedLock:
             await trio.sleep(10)
 
     def release(self):
-        REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
+        """
+        Tolerant lock release that doesn't fail the pipeline on transient Redis errors.
+        Relies on TTL as fallback for cleanup if release fails.
+        """
+        try:
+            REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
+            logging.debug(f"Successfully released Redis lock: {self.lock_key}")
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"Transient Redis error during lock release for {self.lock_key}: {e}. "
+                          f"Lock will expire via TTL in {self.timeout}s")
+            # Force connection pool reset to ensure fresh connection for next operation
+            try:
+                if REDIS_CONN.REDIS and hasattr(REDIS_CONN.REDIS, 'connection_pool'):
+                    REDIS_CONN.REDIS.connection_pool.disconnect()
+                    logging.info("Redis connection pool reset after transient error")
+            except Exception as reset_e:
+                logging.warning(f"Failed to reset Redis connection pool: {reset_e}")
+        except Exception as e:
+            logging.error(f"Unexpected error during lock release for {self.lock_key}: {e}. "
+                         f"Lock will expire via TTL in {self.timeout}s")
+            # Even on unexpected errors, don't propagate to avoid breaking the pipeline
