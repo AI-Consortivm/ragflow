@@ -27,7 +27,14 @@ infinity:
 redis:
   db: 1
   password: '${REDIS_PASSWORD:-infini_rag_flow}'
-  host: '${REDIS_HOST:-redis}:6379'
+  host: '${REDIS_HOST:-redis}'
+  port: ${REDIS_PORT:-6379}
+  # SSL/TLS configuration for Azure Redis (recommended for production)
+  ssl: ${REDIS_SSL:-false}   # Set to true for Azure Redis or production environments
+  # Connection hardening for Azure Redis (optional - defaults will be used if not specified)
+  health_check_interval: ${REDIS_HEALTH_CHECK_INTERVAL:-30}  # Ping server every 30s during idle to detect stale connections
+  socket_timeout: ${REDIS_SOCKET_TIMEOUT:-30}                # Socket timeout for operations after connection established
+  socket_connect_timeout: ${REDIS_SOCKET_CONNECT_TIMEOUT:-10}# Timeout for establishing initial connection
 
 # postgres:
 #   name: '${POSTGRES_DBNAME:-rag_flow}'
