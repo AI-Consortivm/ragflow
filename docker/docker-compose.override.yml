@@ -23,6 +23,7 @@ services:
         required: true
     command:
       - --disable-taskexecutor
+    restart: unless-stopped
 
   # === BIND MOUNTS FOR DATA PERSISTENCE ===
   es01:
