@@ -24,7 +24,7 @@ from rag.utils import singleton
 from valkey.lock import Lock
 from valkey.retry import Retry
 from valkey.backoff import ExponentialBackoff
-from valkey.exceptions import ConnectionError, TimeoutError, ConnectionResetError, BusyLoadingError
+from valkey.exceptions import ConnectionError, TimeoutError, BusyLoadingError
 import trio
 
 class RedisMsg:
@@ -76,7 +76,7 @@ class RedisDB:
         try:
             # Configure retry with exponential backoff for connection resilience
             retry_config = Retry(ExponentialBackoff(), 3)
-            retry_on_error_list = [ConnectionError, TimeoutError, ConnectionResetError, BusyLoadingError]
+            retry_on_error_list = [ConnectionError, TimeoutError, BusyLoadingError]
             
             # Extract connection parameters with Azure Redis best practices
             host_parts = self.config["host"].split(":")
@@ -101,12 +101,7 @@ class RedisDB:
                 "health_check_interval": int(self.config.get("health_check_interval", 30)),
                 "socket_timeout": float(self.config.get("socket_timeout", 30)),
                 "socket_connect_timeout": float(self.config.get("socket_connect_timeout", 10)),
-                "socket_keepalive": True,
-                "socket_keepalive_options": {
-                    1: 1,  # TCP_KEEPIDLE
-                    2: 3,  # TCP_KEEPINTVL  
-                    3: 5   # TCP_KEEPCNT
-                }
+                "socket_keepalive": True
             }
             
             self.REDIS = redis.StrictRedis(**connection_params)
@@ -117,12 +112,24 @@ class RedisDB:
         return self.REDIS
 
     def health(self):
-        self.REDIS.ping()
-        a, b = "xx", "yy"
-        self.REDIS.set(a, b, 3)
+        if not self.REDIS:
+            return False
+        
+        try:
+            self.REDIS.ping()
+            a, b = "xx", "yy"
+            self.REDIS.set(a, b, 3)
 
-        if self.REDIS.get(a) == b:
-            return True
+            if self.REDIS.get(a) == b:
+                return True
+        except (ConnectionError, TimeoutError) as e:
+            logging.warning(f"Redis health check failed with transient error: {e}")
+            return False
+        except Exception as e:
+            logging.warning(f"Redis health check failed with unexpected error: {e}")
+            return False
+        
+        return False
 
     def is_alive(self):
         return self.REDIS is not None
@@ -141,7 +148,7 @@ class RedisDB:
             # Use PING to check connection health
             self.REDIS.ping()
             return True
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"Redis health check failed with transient error: {e}. Reconnecting.")
             self.__open__()
             return self.REDIS is not None
@@ -155,7 +162,7 @@ class RedisDB:
             return
         try:
             return self.REDIS.exists(k)
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"RedisDB.exist {k} got transient error: {e}. Attempting reconnection.")
             self.__open__()
         except Exception as e:
@@ -167,7 +174,7 @@ class RedisDB:
             return
         try:
             return self.REDIS.get(k)
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"RedisDB.get {k} got transient error: {e}. Attempting reconnection.")
             self.__open__()
         except Exception as e:
@@ -178,7 +185,7 @@ class RedisDB:
         try:
             self.REDIS.set(k, json.dumps(obj, ensure_ascii=False), exp)
             return True
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"RedisDB.set_obj {k} got transient error: {e}. Attempting reconnection.")
             self.__open__()
         except Exception as e:
@@ -190,7 +197,7 @@ class RedisDB:
         try:
             self.REDIS.set(k, v, exp)
             return True
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"RedisDB.set {k} got transient error: {e}. Attempting reconnection.")
             self.__open__()
         except Exception as e:
@@ -395,7 +402,7 @@ class RedisDB:
         try:
             self.REDIS.delete(key)
             return True
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"RedisDB.delete {key} got transient error: {e}. Attempting reconnection.")
             self.__open__()
         except Exception as e:
@@ -427,7 +434,7 @@ class RedisDistributedLock:
             if result:
                 logging.debug(f"Successfully acquired Redis lock: {self.lock_key}")
             return result
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"Transient Redis error during lock acquire for {self.lock_key}: {e}")
             # Let the retry mechanism in the client handle this
             raise
@@ -450,7 +457,7 @@ class RedisDistributedLock:
         try:
             REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
             logging.debug(f"Successfully released Redis lock: {self.lock_key}")
-        except (ConnectionError, TimeoutError, ConnectionResetError) as e:
+        except (ConnectionError, TimeoutError) as e:
             logging.warning(f"Transient Redis error during lock release for {self.lock_key}: {e}. "
                           f"Lock will expire via TTL in {self.timeout}s")
             # Force connection pool reset to ensure fresh connection for next operation
