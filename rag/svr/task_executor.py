@@ -277,7 +277,7 @@ async def build_chunks(task, progress_callback):
     async def upload_to_minio(document, chunk):
         try:
             async with minio_limiter:
-                d = copy.deepcopy(document)
+                d = document.copy()
                 d.update(chunk)
                 d["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(d["doc_id"])).encode("utf-8")).hexdigest()
                 d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
@@ -294,6 +294,7 @@ async def build_chunks(task, progress_callback):
                 else:
                     d["image"].save(output_buffer, format='JPEG')
                 await trio.to_thread.run_sync(lambda: STORAGE_IMPL.put(task["kb_id"], d["id"], output_buffer.getvalue()))
+                output_buffer.close()
 
                 d["img_id"] = "{}-{}".format(task["kb_id"], d["id"])
                 del d["image"]
@@ -472,7 +473,7 @@ async def run_raptor(row, chat_mdl, embd_mdl, vector_size, callback=None):
     res = []
     tk_count = 0
     for content, vctr in chunks[original_length:]:
-        d = copy.deepcopy(doc)
+        d = doc.copy()
         d["id"] = xxhash.xxh64((content + str(d["doc_id"])).encode("utf-8")).hexdigest()
         d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
         d["create_timestamp_flt"] = datetime.now().timestamp()
@@ -576,7 +577,7 @@ async def do_handle_task(task):
     chunk_count = len(set([chunk["id"] for chunk in chunks]))
     start_ts = timer()
     doc_store_result = ""
-    es_bulk_size = 4
+    es_bulk_size = 64
     for b in range(0, len(chunks), es_bulk_size):
         doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert(chunks[b:b + es_bulk_size], search.index_name(task_tenant_id), task_dataset_id))
         if b % 128 == 0:
