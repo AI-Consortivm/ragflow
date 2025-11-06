@@ -31,7 +31,6 @@ import os
 from datetime import datetime
 import json
 import xxhash
-import copy
 import re
 from functools import partial
 from io import BytesIO
@@ -234,6 +233,7 @@ async def build_chunks(task, progress_callback):
         return []
 
     chunker = FACTORY[task["parser_id"].lower()]
+    binary = None
     try:
         st = timer()
         bucket, name = File2DocumentService.get_storage_address(doc_id=task["doc_id"])
@@ -264,6 +264,11 @@ async def build_chunks(task, progress_callback):
         progress_callback(-1, "Internal server error while chunking: %s" % str(e).replace("'", ""))
         logging.exception("Chunking {}/{} got exception".format(task["location"], task["name"]))
         raise
+    finally:
+        # Free binary data immediately after chunking, even if errors occurred
+        if binary is not None:
+            del binary
+            logging.debug(f"Freed binary data for {task['name']}")
 
     docs = []
     doc = {
@@ -401,48 +406,85 @@ def init_kb(row, vector_size: int):
 
 
 async def embedding(docs, mdl, parser_config=None, callback=None):
+    """
+    Generate embeddings for document chunks with memory-efficient pre-allocation.
+
+    Args:
+        docs: List of document chunks to embed
+        mdl: Embedding model
+        parser_config: Parser configuration
+        callback: Progress callback function
+
+    Returns:
+        Tuple of (token_count, vector_size)
+    """
     if parser_config is None:
         parser_config = {}
     batch_size = 16
     tts, cnts = [], []
-    for d in docs:
-        tts.append(d.get("docnm_kwd", "Title"))
-        c = "\n".join(d.get("question_kwd", []))
-        if not c:
-            c = d["content_with_weight"]
-        c = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", c)
-        if not c:
-            c = "None"
-        cnts.append(c)
 
-    tk_count = 0
-    if len(tts) == len(cnts):
-        vts, c = await trio.to_thread.run_sync(lambda: mdl.encode(tts[0: 1]))
-        tts = np.concatenate([vts for _ in range(len(tts))], axis=0)
-        tk_count += c
+    try:
+        for d in docs:
+            tts.append(d.get("docnm_kwd", "Title"))
+            c = "\n".join(d.get("question_kwd", []))
+            if not c:
+                c = d["content_with_weight"]
+            c = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", c)
+            if not c:
+                c = "None"
+            cnts.append(c)
 
-    cnts_ = np.array([])
-    for i in range(0, len(cnts), batch_size):
-        vts, c = await trio.to_thread.run_sync(lambda: mdl.encode([truncate(c, mdl.max_length-10) for c in cnts[i: i + batch_size]]))
-        if len(cnts_) == 0:
-            cnts_ = vts
-        else:
-            cnts_ = np.concatenate((cnts_, vts), axis=0)
-        tk_count += c
-        callback(prog=0.7 + 0.2 * (i + 1) / len(cnts), msg="")
-    cnts = cnts_
+        tk_count = 0
+        if len(tts) == len(cnts):
+            vts, c = await trio.to_thread.run_sync(lambda: mdl.encode(tts[0: 1]))
+            # Use np.tile for efficient replication instead of list comprehension + concatenate
+            tts = np.tile(vts, (len(tts), 1))
+            tk_count += c
+            del vts  # Free memory immediately
 
-    title_w = float(parser_config.get("filename_embd_weight", 0.1))
-    vects = (title_w * tts + (1 - title_w) *
-             cnts) if len(tts) == len(cnts) else cnts
+        # Pre-allocate array for better memory efficiency
+        cnts_ = None
+        vector_dim = None
+        for i in range(0, len(cnts), batch_size):
+            vts, c = await trio.to_thread.run_sync(lambda: mdl.encode([truncate(c, mdl.max_length-10) for c in cnts[i: i + batch_size]]))
 
-    assert len(vects) == len(docs)
-    vector_size = 0
-    for i, d in enumerate(docs):
-        v = vects[i].tolist()
-        vector_size = len(v)
-        d["q_%d_vec" % len(v)] = v
-    return tk_count, vector_size
+            if cnts_ is None:
+                # First batch: determine dimensions and pre-allocate full array
+                vector_dim = vts.shape[1]
+                cnts_ = np.empty((len(cnts), vector_dim), dtype=vts.dtype)
+
+            # Copy batch into pre-allocated array (no reallocation needed)
+            end_idx = min(i + batch_size, len(cnts))
+            cnts_[i:end_idx] = vts
+
+            tk_count += c
+            del vts  # Free batch immediately
+            callback(prog=0.7 + 0.2 * (i + 1) / len(cnts), msg="")
+
+        cnts = cnts_
+        del cnts_  # Free temporary reference
+
+        title_w = float(parser_config.get("filename_embd_weight", 0.1))
+        vects = (title_w * tts + (1 - title_w) *
+                 cnts) if len(tts) == len(cnts) else cnts
+
+        assert len(vects) == len(docs)
+        vector_size = 0
+        for i, d in enumerate(docs):
+            v = vects[i].tolist()
+            vector_size = len(v)
+            d["q_%d_vec" % len(v)] = v
+        return tk_count, vector_size
+
+    except Exception as e:
+        logging.error(f"Error during embedding generation: {e}")
+        # Clean up any partially allocated arrays
+        try:
+            del tts, cnts, vects
+        except NameError:
+            # Variables may not be defined if error occurred early
+            pass
+        raise
 
 
 async def run_raptor(row, chat_mdl, embd_mdl, vector_size, callback=None):
@@ -578,6 +620,7 @@ async def do_handle_task(task):
     start_ts = timer()
     doc_store_result = ""
     es_bulk_size = 64
+    chunk_ids = []  # Build incrementally instead of recreating each iteration
     for b in range(0, len(chunks), es_bulk_size):
         doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert(chunks[b:b + es_bulk_size], search.index_name(task_tenant_id), task_dataset_id))
         if b % 128 == 0:
@@ -586,7 +629,9 @@ async def do_handle_task(task):
             error_message = f"Insert chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
             progress_callback(-1, msg=error_message)
             raise Exception(error_message)
-        chunk_ids = [chunk["id"] for chunk in chunks[:b + es_bulk_size]]
+        # Incrementally build chunk_ids list - much more efficient!
+        batch_chunk_ids = [chunk["id"] for chunk in chunks[b:b + es_bulk_size]]
+        chunk_ids.extend(batch_chunk_ids)
         chunk_ids_str = " ".join(chunk_ids)
         try:
             TaskService.update_chunk_ids(task["id"], chunk_ids_str)
@@ -617,7 +662,17 @@ async def handle_task():
         return
     try:
         logging.info(f"handle_task begin for task {json.dumps(task)}")
-        CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
+        # Store only essential fields for monitoring - saves 200KB+ per task
+        CURRENT_TASKS[task["id"]] = {
+            "id": task["id"],
+            "doc_id": task["doc_id"],
+            "name": task.get("name", ""),
+            "kb_id": task.get("kb_id", ""),
+            "parser_id": task.get("parser_id", ""),
+            "size": task.get("size", 0),
+            "from_page": task.get("from_page", 0),
+            "to_page": task.get("to_page", 0),
+        }
         await do_handle_task(task)
         DONE_TASKS += 1
         CURRENT_TASKS.pop(task["id"], None)
@@ -649,7 +704,8 @@ async def report_status():
                 PENDING_TASKS = int(group_info.get("pending", 0))
                 LAG_TASKS = int(group_info.get("lag", 0))
 
-            current = copy.deepcopy(CURRENT_TASKS)
+            # Shallow copy is sufficient since we already store minimal task info
+            current = CURRENT_TASKS.copy()
             heartbeat = json.dumps({
                 "name": CONSUMER_NAME,
                 "now": now.astimezone().isoformat(timespec="milliseconds"),
