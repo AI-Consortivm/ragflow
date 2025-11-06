@@ -103,28 +103,67 @@ class RAGFlowExcelParser:
         return tb_chunks
 
     def __call__(self, fnm):
+        """
+        Parse Excel file using memory-efficient generator pattern.
+        No row limits - generators handle memory efficiently.
+
+        Args:
+            fnm: File name or binary content
+
+        Returns:
+            List of parsed text lines
+        """
         file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
-        wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
+
+        try:
+            wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
+        except Exception as e:
+            logging.error(f"Failed to load Excel workbook: {e}")
+            raise
 
         res = []
+        total_rows_processed = 0
+
         for sheetname in wb.sheetnames:
-            ws = wb[sheetname]
-            rows = list(ws.rows)
-            if not rows:
+            try:
+                ws = wb[sheetname]
+                rows_iter = ws.iter_rows()  # Generator - memory efficient!
+
+                # Get header row
+                try:
+                    header_row = next(rows_iter)
+                except StopIteration:
+                    logging.debug(f"Sheet '{sheetname}' is empty, skipping")
+                    continue
+
+                # Process all data rows using generator (no limit needed - memory efficient!)
+                row_count = 0
+                for r in rows_iter:
+                    fields = []
+                    for i, c in enumerate(r):
+                        if not c.value:
+                            continue
+                        t = str(header_row[i].value) if i < len(header_row) else ""
+                        t += ("：" if t else "") + str(c.value)
+                        fields.append(t)
+
+                    if fields:  # Only append non-empty rows
+                        line = "; ".join(fields)
+                        if sheetname.lower().find("sheet") < 0:
+                            line += " ——" + sheetname
+                        res.append(line)
+
+                    row_count += 1
+
+                total_rows_processed += row_count
+                logging.debug(f"Processed {row_count} rows from sheet '{sheetname}'")
+
+            except Exception as e:
+                logging.error(f"Error processing sheet '{sheetname}': {e}")
+                # Continue with next sheet instead of failing completely
                 continue
-            ti = rows[0]
-            for r in rows[1:]:
-                fields = []
-                for i, c in enumerate(r):
-                    if not c.value:
-                        continue
-                    t = str(ti[i].value) if i < len(ti) else ""
-                    t += ("：" if t else "") + str(c.value)
-                    fields.append(t)
-                line = "; ".join(fields)
-                if sheetname.lower().find("sheet") < 0:
-                    line += " ——" + sheetname
-                res.append(line)
+
+        logging.info(f"Excel parsing complete: {len(res)} lines from {total_rows_processed} rows across {len(wb.sheetnames)} sheets")
         return res
 
     @staticmethod
