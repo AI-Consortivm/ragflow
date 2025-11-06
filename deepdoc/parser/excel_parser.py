@@ -104,8 +104,9 @@ class RAGFlowExcelParser:
 
     def __call__(self, fnm):
         """
-        Parse Excel file using memory-efficient generator pattern.
-        No row limits - generators handle memory efficiently.
+        Parse Excel file with automatic fallback strategy:
+        1. Try structured parsing (assumes row 1 is header)
+        2. If minimal content or failure, use plain text extraction
 
         Args:
             fnm: File name or binary content
@@ -113,13 +114,29 @@ class RAGFlowExcelParser:
         Returns:
             List of parsed text lines
         """
-        file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
-
+        # Try structured parsing first
         try:
-            wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
+            res = self._structured_parse(fnm)
+            total_chars = sum(len(line) for line in res)
+
+            if total_chars < 50:
+                logging.warning(f"Structured parsing yielded minimal content ({total_chars} chars), using plain text fallback")
+                return self._plain_text_parse(fnm)
+
+            logging.info(f"Structured parsing successful: {len(res)} lines, {total_chars} chars")
+            return res
+
         except Exception as e:
-            logging.error(f"Failed to load Excel workbook: {e}")
-            raise
+            logging.warning(f"Structured parsing failed: {e}, using plain text fallback")
+            return self._plain_text_parse(fnm)
+
+    def _structured_parse(self, fnm):
+        """
+        Parse Excel assuming first row of each sheet is a header.
+        Formats as: "Header1：Value1; Header2：Value2"
+        """
+        file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
+        wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
 
         res = []
         total_rows_processed = 0
@@ -141,7 +158,7 @@ class RAGFlowExcelParser:
                 for r in rows_iter:
                     fields = []
                     for i, c in enumerate(r):
-                        if not c.value:
+                        if c.value is None:  # Fixed: was "if not c.value" which skipped 0, False, ""
                             continue
                         t = str(header_row[i].value) if i < len(header_row) else ""
                         t += ("：" if t else "") + str(c.value)
@@ -163,7 +180,56 @@ class RAGFlowExcelParser:
                 # Continue with next sheet instead of failing completely
                 continue
 
-        logging.info(f"Excel parsing complete: {len(res)} lines from {total_rows_processed} rows across {len(wb.sheetnames)} sheets")
+        logging.info(f"Structured parsing complete: {len(res)} lines from {total_rows_processed} rows")
+        return res
+
+    def _plain_text_parse(self, fnm):
+        """
+        Fallback parser for complex Excel files.
+        Extracts all cells sequentially without header assumptions.
+        Handles multi-table sheets, images, complex formatting.
+        """
+        file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
+
+        try:
+            wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
+        except Exception as e:
+            logging.error(f"Failed to load Excel workbook in plain text mode: {e}")
+            raise
+
+        res = []
+        total_rows_processed = 0
+
+        for sheetname in wb.sheetnames:
+            try:
+                ws = wb[sheetname]
+                rows = list(ws.iter_rows())
+
+                if not rows:
+                    logging.debug(f"Sheet '{sheetname}' is empty, skipping")
+                    continue
+
+                sheet_label = f" (Sheet: {sheetname})" if sheetname.lower().find("sheet") < 0 else ""
+
+                # Extract all rows as plain text
+                for row_num, row in enumerate(rows, start=1):
+                    cells = []
+                    for cell in row:
+                        if cell.value is not None:  # Fixed: was "if not c.value"
+                            cells.append(str(cell.value))
+
+                    if cells:  # Non-empty row
+                        line = " | ".join(cells) + sheet_label
+                        res.append(line)
+                        total_rows_processed += 1
+                    # Note: We skip blank rows to avoid clutter
+
+            except Exception as e:
+                logging.error(f"Error processing sheet '{sheetname}' in plain text mode: {e}")
+                # Continue with next sheet
+                continue
+
+        logging.info(f"Plain text parsing complete: {len(res)} lines from {total_rows_processed} rows across {len(wb.sheetnames)} sheets")
         return res
 
     @staticmethod
