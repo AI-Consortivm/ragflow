@@ -15,6 +15,7 @@
 #
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -192,11 +193,19 @@ def thumbnail_img(filename, blob):
         return img
 
     elif re.match(r".*\.(jpg|jpeg|png|tif|gif|icon|ico|webp)$", filename):
-        image = Image.open(BytesIO(blob))
-        image.thumbnail((30, 30))
-        buffered = BytesIO()
-        image.save(buffered, format="png")
-        return buffered.getvalue()
+        try:
+            image = Image.open(BytesIO(blob))
+            # Convert to RGB to handle CMYK, RGBA, LA, P, etc. modes
+            if image.mode not in ('RGB', 'L'):
+                image = image.convert('RGB')
+            image.thumbnail((30, 30))
+            buffered = BytesIO()
+            image.save(buffered, format="png")
+            return buffered.getvalue()
+        except Exception as e:
+            # Log the error and return None to allow upload to continue without thumbnail
+            logging.warning(f"Failed to generate thumbnail for {filename}: {str(e)}")
+            return None
 
     elif re.match(r".*\.(ppt|pptx)$", filename):
         import aspose.pydrawing as drawing
